@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>暈眩週追蹤工具 Pro (大地綠版)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, getDoc, collection, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- 配置與初始化 ---
+        const firebaseConfig = JSON.parse(__firebase_config);
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'dizziness-tracker-v2';
+
+        window.trackerApp = {
+            db: [],
+            user: null,
+            myChart: null,
+            levelDescriptions: {
+                0: "0級：完全沒事，頭腦很清爽。",
+                1: "1級：有一點點飄飄的，不影響生活。",
+                2: "2級：輕微頭重腳輕，還可以走路。",
+                3: "3級：明顯感覺暈，走路要慢慢走。",
+                4: "4級：開始天旋地轉，需要坐下來休息。",
+                5: "5級：走路不穩，身體會晃，不能開車。",
+                6: "6級：一定要扶著牆壁走，看東西會想吐。",
+                7: "7級：完全站不穩，必須立刻躺下休息。",
+                8: "8級：躺著也覺得天旋地轉，非常難受。",
+                9: "9級：嚴重嘔吐，沒辦法吃東西，很不舒服。",
+                10: "10級：最嚴重的痛苦，請立即由家人陪同就醫。"
+            }
+        };
+
+        // --- 認證處理 ---
+        const initAuth = async () => {
+            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                await signInWithCustomToken(auth, __initial_auth_token);
+            } else {
+                await signInAnonymously(auth);
+            }
+        };
+
+        onAuthStateChanged(auth, (user) => {
+            if (user) {
+                window.trackerApp.user = user;
+                document.getElementById('syncStatus').innerText = "🌿 雲端守護中";
+                const userDocRef = doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'data');
+                onSnapshot(userDocRef, (docSnap) => {
+                    if (docSnap.exists()) {
+                        window.trackerApp.db = docSnap.data().records || [];
+                        updateUI();
+                    }
+                }, (error) => console.error("Snapshot error:", error));
+            }
+        });
+
+        initAuth();
+
+        window.updateLevelHint = (val) => {
+            document.getElementById('levelVal').innerText = val;
+            document.getElementById('levelHint').innerText = window.trackerApp.levelDescriptions[val];
+        };
+
+        window.toggleOtherInput = (id, checkbox) => {
+            const container = document.getElementById(id);
+            if (checkbox.checked) {
+                container.classList.remove('hidden');
+            } else {
+                container.classList.add('hidden');
+            }
+        };
+
+        window.saveRecord = async () => {
+            const getChecked = (name) => Array.from(document.querySelectorAll(`input[name="${name}"]:checked`)).map(i => i.value);
+            
+            const newEntry = {
+                id: Date.now(),
+                date: document.getElementById('date').value,
+                sleep: parseFloat(document.getElementById('sleep').value) || 0,
+                nap: parseInt(document.getElementById('nap').value) || 0,
+                level: parseInt(document.getElementById('level').value),
+                occurTimes: getChecked('occurTime'),
+                symptoms: getChecked('symptoms'),
+                symptomOtherText: document.getElementById('symptomOtherText').value,
+                dietPrecautions: getChecked('dietPrecautions'),
+                dietOtherText: document.getElementById('dietOtherText').value,
+                normalMeals: getChecked('normalMeals')
+            };
+
+            window.trackerApp.db.push(newEntry);
+            window.trackerApp.db.sort((a, b) => new Date(a.date) - new Date(b.date));
+            await syncToCloud();
+            
+            // 重置表單
+            document.getElementById('sleep').value = '';
+            document.getElementById('nap').value = '';
+            document.getElementById('level').value = 0;
+            document.getElementById('symptomOtherText').value = '';
+            document.getElementById('dietOtherText').value = '';
+            document.getElementById('symptomOtherContainer').classList.add('hidden');
+            document.getElementById('dietOtherContainer').classList.add('hidden');
+            window.updateLevelHint(0);
+            document.querySelectorAll('input[type="checkbox"]').forEach(i => i.checked = false);
+            alert("紀錄成功！資料已存入雲端。");
+        };
+
+        window.deleteRecord = async (id) => {
+            if (confirm("確定要刪除這筆紀錄嗎？")) {
+                window.trackerApp.db = window.trackerApp.db.filter(item => item.id !== id);
+                await syncToCloud();
+            }
+        };
+
+        const syncToCloud = async () => {
+            if (!window.trackerApp.user) return;
+            const userDocRef = doc(db, 'artifacts', appId, 'users', window.trackerApp.user.uid, 'settings', 'data');
+            try {
+                await setDoc(userDocRef, { records: window.trackerApp.db });
+                document.getElementById('syncIndicator').classList.remove('hidden');
+                setTimeout(() => document.getElementById('syncIndicator').classList.add('hidden'), 2000);
+            } catch (e) { console.error("Sync error:", e); }
+        };
+
+        const updateUI = () => {
+            renderTable();
+            renderChart();
+            updateStats();
+        };
+
+        const updateStats = () => {
+            const db = window.trackerApp.db;
+            const total = db.length;
+            const avgDiz = total ? (db.reduce((acc, curr) => acc + curr.level, 0) / total).toFixed(1) : "0.0";
+            const avgSlp = total ? (db.reduce((acc, curr) => acc + curr.sleep, 0) / total).toFixed(1) : "0.0";
+
+            document.getElementById('avgDizziness').innerText = avgDiz;
+            document.getElementById('avgSleep').innerText = avgSlp;
+            document.getElementById('totalRecords').innerText = total;
+        };
+
+        const renderTable = () => {
+            const list = document.getElementById('recordList');
+            const db = window.trackerApp.db;
+            list.innerHTML = db.length ? '' : '<tr><td colspan="5" class="p-10 text-center text-stone-400 text-xl italic">尚無歷史紀錄</td></tr>';
+            
+            [...db].reverse().forEach(item => {
+                const colorClass = item.level >= 8 ? 'text-orange-900' : (item.level >= 4 ? 'text-orange-700' : 'text-emerald-800');
+                
+                let dietInfo = [];
+                if (item.dietPrecautions && item.dietPrecautions.length > 0) {
+                    let p = item.dietPrecautions.map(v => v === '其他' ? `其他(${item.dietOtherText || ''})` : v).join(', ');
+                    dietInfo.push(`生活注意：${p}`);
+                }
+                if (item.normalMeals && item.normalMeals.length > 0) {
+                    dietInfo.push(`正常餐食：${item.normalMeals.join(', ')}`);
+                }
+
+                let s = (item.symptoms || []).map(v => v === '其他' ? `其他(${item.symptomOtherText || ''})` : v).join(', ');
+
+                const row = `
+                    <tr class="hover:bg-stone-50 transition border-b border-stone-100">
+                        <td class="p-5">
+                            <div class="text-emerald-900 font-bold text-xl">${item.date}</div>
+                            <div class="text-lg text-emerald-600/70 mt-1">${item.occurTimes ? item.occurTimes.join('、') : '-'}</div>
+                        </td>
+                        <td class="p-5 text-center">
+                            <span class="font-black text-3xl ${colorClass}">${item.level}</span>
+                        </td>
+                        <td class="p-5 text-lg text-emerald-800">
+                            <div>💤 ${item.sleep}時</div>
+                            <div>🛌 ${item.nap}分</div>
+                        </td>
+                        <td class="p-5 text-lg">
+                            <div class="text-emerald-900 mb-1 font-medium"><span class="text-emerald-600 font-black">不舒服：</span>${s || '無'}</div>
+                            <div class="text-stone-500 text-base leading-relaxed">${dietInfo.join('<br>') || '未記錄細節'}</div>
+                        </td>
+                        <td class="p-5 text-right">
+                            <button onclick="deleteRecord(${item.id})" class="bg-stone-100 text-stone-400 hover:text-orange-800 w-12 h-12 rounded-full text-2xl flex items-center justify-center mx-auto transition">✕</button>
+                        </td>
+                    </tr>
+                `;
+                list.innerHTML += row;
+            });
+        };
+
+        const renderChart = () => {
+            const canvas = document.getElementById('healthChart');
+            if (!canvas) return;
+            const ctx = canvas.getContext('2d');
+            const db = window.trackerApp.db;
+            const labels = db.map(i => i.date);
+            const levelData = db.map(i => i.level);
+            const sleepData = db.map(i => i.sleep);
+
+            if (window.trackerApp.myChart) window.trackerApp.myChart.destroy();
+
+            window.trackerApp.myChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [
+                        {
+                            label: '暈眩程度',
+                            data: levelData,
+                            borderColor: '#064e3b',
+                            borderWidth: 4,
+                            backgroundColor: 'rgba(6, 78, 59, 0.1)',
+                            fill: true,
+                            tension: 0.3,
+                            yAxisID: 'y'
+                        },
+                        {
+                            label: '睡眠時數',
+                            data: sleepData,
+                            borderColor: '#84cc16',
+                            borderWidth: 4,
+                            borderDash: [8, 4],
+                            tension: 0.3,
+                            yAxisID: 'y1'
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { labels: { font: { size: 16, weight: 'bold' }, color: '#064e3b' } }
+                    },
+                    scales: {
+                        y: { min: 0, max: 10, ticks: { font: { size: 14 } } },
+                        y1: { position: 'right', min: 0, max: 15, grid: { drawOnChartArea: false }, ticks: { font: { size: 14 } } },
+                        x: { ticks: { font: { size: 14 } } }
+                    }
+                }
+            });
+        };
+
+        window.exportCSV = () => {
+            const db = window.trackerApp.db;
+            if (db.length === 0) return alert("還沒有紀錄喔！");
+            let csv = "\uFEFF日期,發生時間,睡眠時數(h),午睡(m),暈眩程度,伴隨症狀,症狀其他,飲食注意,飲食其他,正常餐食\n";
+            db.forEach(row => {
+                csv += `${row.date},"${(row.occurTimes || []).join('|')}",${row.sleep},${row.nap},${row.level},"${(row.symptoms || []).join('|')}","${row.symptomOtherText || ''}","${(row.dietPrecautions || []).join('|')}","${row.dietOtherText || ''}","${(row.normalMeals || []).join('|')}"\n`;
+            });
+            const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement("a");
+            link.href = URL.createObjectURL(blob);
+            link.download = `健康紀錄表_${new Date().toISOString().split('T')[0]}.csv`;
+            link.click();
+        };
+
+        window.clearAll = async () => {
+            if (confirm("確定要刪除所有紀錄嗎？雲端上的紀錄也會不見喔！")) {
+                window.trackerApp.db = [];
+                await syncToCloud();
+            }
+        };
+
+        document.addEventListener('DOMContentLoaded', () => {
+            document.getElementById('date').valueAsDate = new Date();
+        });
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;700;900&display=swap');
+        body { font-family: 'Noto Sans TC', sans-serif; background-color: #fcfaf2; font-size: 18px; color: #1a2e1a; }
+        
+        /* 大地色滑桿 */
+        input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            height: 40px;
+            width: 40px;
+            border-radius: 50%;
+            background: #064e3b;
+            cursor: pointer;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.2);
+            margin-top: -14px;
+            border: 3px solid #fcfaf2;
+        }
+        input[type=range]::-webkit-slider-runnable-track {
+            height: 14px;
+            background: #d1d5db;
+            border-radius: 7px;
+        }
+
+        .checkbox-group input:checked + span {
+            background-color: #064e3b;
+            border-color: #064e3b;
+            color: white;
+            transform: scale(1.05);
+        }
+        .checkbox-group span {
+            padding: 16px 22px;
+            font-size: 1.25rem;
+            font-weight: 700;
+            display: block;
+            text-align: center;
+            border-radius: 1rem;
+            transition: all 0.2s;
+        }
+        .earth-card {
+            background: #ffffff;
+            border: 2px solid #e5e7eb;
+            box-shadow: 0 8px 30px rgba(0,0,0,0.03);
+        }
+        .btn-green {
+            background-color: #064e3b;
+            box-shadow: 0 10px 20px -10px #064e3b;
+        }
+    </style>
+</head>
+<body class="p-4 md:p-10">
+    <div class="max-w-7xl mx-auto">
+        <!-- Header -->
+        <header class="mb-10 flex flex-col md:flex-row md:items-center justify-between gap-6 bg-white p-10 rounded-[2.5rem] shadow-sm border border-emerald-100">
+            <div>
+                <h1 class="text-4xl font-black text-emerald-900 mb-2 text-center md:text-left">🌿 暈眩健康紀錄助手</h1>
+                <div class="flex items-center gap-3 justify-center md:justify-start">
+                    <span id="syncIndicator" class="hidden w-4 h-4 bg-lime-500 rounded-full animate-ping"></span>
+                    <p id="syncStatus" class="text-emerald-700/60 text-xl font-bold italic">連線中...</p>
+                </div>
+            </div>
+            <div class="flex gap-4 justify-center">
+                <button onclick="exportCSV()" class="bg-emerald-50 text-emerald-800 border-2 border-emerald-100 px-8 py-4 rounded-2xl text-xl font-bold hover:bg-emerald-100 transition shadow-sm">📥 匯出檔案</button>
+                <button onclick="clearAll()" class="bg-stone-50 text-stone-500 px-6 py-4 rounded-2xl text-lg font-bold hover:bg-stone-100 transition">清空</button>
+            </div>
+        </header>
+
+        <!-- Stats Overview -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-8 mb-10">
+            <div class="bg-white p-8 rounded-[2rem] shadow-md border-t-8 border-emerald-800 text-center">
+                <h3 class="text-xl font-bold text-stone-400 mb-2 uppercase tracking-wide">平均暈眩</h3>
+                <p class="text-6xl font-black text-emerald-900"><span id="avgDizziness">0.0</span> <span class="text-xl text-stone-300">級</span></p>
+            </div>
+            <div class="bg-white p-8 rounded-[2rem] shadow-md border-t-8 border-lime-500 text-center">
+                <h3 class="text-xl font-bold text-stone-400 mb-2 uppercase tracking-wide">平均睡眠</h3>
+                <p class="text-6xl font-black text-lime-700"><span id="avgSleep">0.0</span> <span class="text-xl text-stone-300">時</span></p>
+            </div>
+            <div class="bg-white p-8 rounded-[2rem] shadow-md border-t-8 border-stone-800 text-center">
+                <h3 class="text-xl font-bold text-stone-400 mb-2 uppercase tracking-wide">總紀錄筆數</h3>
+                <p class="text-6xl font-black text-stone-800"><span id="totalRecords">0</span> <span class="text-xl text-stone-300">筆</span></p>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-10">
+            <!-- Left: Input Form -->
+            <div class="lg:col-span-5">
+                <div class="earth-card p-10 rounded-[3rem] sticky top-8 max-h-[85vh] overflow-y-auto">
+                    <h2 class="text-3xl font-black mb-10 text-emerald-900 flex items-center gap-3">
+                        <span class="w-12 h-12 bg-emerald-800 text-white rounded-2xl flex items-center justify-center text-2xl shadow-lg">✎</span>
+                        填寫今日紀錄
+                    </h2>
+                    <form id="recordForm" class="space-y-12">
+                        <!-- 1. 日期 -->
+                        <div>
+                            <label class="block text-2xl font-bold text-emerald-800 mb-3">1. 今天日期</label>
+                            <input type="date" id="date" required class="w-full p-6 text-2xl border-2 border-stone-100 rounded-3xl outline-none focus:border-emerald-600 bg-stone-50">
+                        </div>
+
+                        <!-- 2 & 3. 睡眠 -->
+                        <div class="grid grid-cols-2 gap-8">
+                            <div>
+                                <label class="block text-2xl font-bold text-emerald-800 mb-3">2. 晚上睡覺(時)</label>
+                                <input type="number" id="sleep" step="0.5" placeholder="7.5" class="w-full p-6 text-2xl border-2 border-stone-100 rounded-3xl bg-stone-50">
+                            </div>
+                            <div>
+                                <label class="block text-2xl font-bold text-emerald-800 mb-3">3. 午睡(分)</label>
+                                <input type="number" id="nap" placeholder="30" class="w-full p-6 text-2xl border-2 border-stone-100 rounded-3xl bg-stone-50">
+                            </div>
+                        </div>
+
+                        <!-- 4. 暈眩程度 -->
+                        <div>
+                            <div class="flex justify-between items-end mb-5">
+                                <label class="text-2xl font-bold text-emerald-800">4. 暈眩程度</label>
+                                <span class="text-5xl font-black text-emerald-900 bg-emerald-50 px-6 py-2 rounded-2xl border-2 border-emerald-100"><span id="levelVal">0</span> 級</span>
+                            </div>
+                            <input type="range" id="level" min="0" max="10" value="0" class="w-full h-4 bg-stone-200 rounded-lg appearance-none cursor-pointer" oninput="updateLevelHint(this.value)">
+                            <div id="levelHint" class="mt-6 p-8 bg-emerald-800 text-white text-2xl rounded-[2rem] font-bold shadow-inner leading-relaxed text-center">
+                                0級：完全沒事，頭腦很清爽。
+                            </div>
+                        </div>
+
+                        <!-- 5. 發生時間 -->
+                        <div>
+                            <label class="block text-2xl font-bold text-emerald-800 mb-5">5. 發生時間 (可多選)</label>
+                            <div class="grid grid-cols-2 gap-4 checkbox-group">
+                                <label class="relative cursor-pointer"><input type="checkbox" name="occurTime" value="早上" class="sr-only"><span class="border-2 border-stone-100 bg-white">早上</span></label>
+                                <label class="relative cursor-pointer"><input type="checkbox" name="occurTime" value="中午" class="sr-only"><span class="border-2 border-stone-100 bg-white">中午</span></label>
+                                <label class="relative cursor-pointer"><input type="checkbox" name="occurTime" value="下午" class="sr-only"><span class="border-2 border-stone-100 bg-white">下午</span></label>
+                                <label class="relative cursor-pointer"><input type="checkbox" name="occurTime" value="晚上" class="sr-only"><span class="border-2 border-stone-100 bg-white">晚上</span></label>
+                            </div>
+                        </div>
+
+                        <!-- 6. 症狀 -->
+                        <div>
+                            <label class="block text-2xl font-bold text-emerald-800 mb-5">6. 有什麼不舒服？ (可多選)</label>
+                            <div class="grid grid-cols-2 gap-4 checkbox-group">
+                                <label class="relative cursor-pointer"><input type="checkbox" name="symptoms" value="耳鳴" class="sr-only"><span class="border-2 border-stone-100 bg-white">耳鳴</span></label>
+                                <label class="relative cursor-pointer"><input type="checkbox" name="symptoms" value="聽力變化" class="sr-only"><span class="border-2 border-stone-100 bg-white">聽力變化</span></label>
+                                <label class="relative cursor-pointer"><input type="checkbox" name="symptoms" value="頭重感" class="sr-only"><span class="border-2 border-stone-100 bg-white">頭重感</span></label>
+                                <label class="relative cursor-pointer"><input type="checkbox" name="symptoms" value="噁心嘔吐" class="sr-only"><span class="border-2 border-stone-100 bg-white">噁心嘔吐</span></label>
+                                <label class="relative cursor-pointer"><input type="checkbox" name="symptoms" value="走路不穩" class="sr-only"><span class="border-2 border-stone-100 bg-white">走路不穩</span></label>
+                                <label class="relative cursor-pointer"><input type="checkbox" name="symptoms" value="其他" class="sr-only" onchange="toggleOtherInput('symptomOtherContainer', this)"><span class="border-2 border-stone-100 bg-white">其他</span></label>
+                            </div>
+                            <div id="symptomOtherContainer" class="mt-4 hidden">
+                                <textarea id="symptomOtherText" placeholder="請填寫其他不舒服的感覺..." class="w-full p-6 text-xl border-2 border-emerald-100 rounded-3xl bg-emerald-50/50 outline-none h-24"></textarea>
+                            </div>
+                        </div>
+
+                        <!-- 7. 飲食注意 -->
+                        <div>
+                            <label class="block text-2xl font-bold text-emerald-800 mb-5">7. 生活注意 (可多選)</label>
+                            <div class="grid grid-cols-2 gap-4 checkbox-group">
+                                <label class="relative cursor-pointer"><input type="checkbox" name="dietPrecautions" value="有喝咖啡" class="sr-only"><span class="border-2 border-stone-100 bg-white">有喝咖啡</span></label>
+                                <label class="relative cursor-pointer"><input type="checkbox" name="dietPrecautions" value="吃太鹹" class="sr-only"><span class="border-2 border-stone-100 bg-white">吃太鹹</span></label>
+                                <label class="relative cursor-pointer"><input type="checkbox" name="dietPrecautions" value="吃太甜" class="sr-only"><span class="border-2 border-stone-100 bg-white">吃太甜</span></label>
+                                <label class="relative cursor-pointer"><input type="checkbox" name="dietPrecautions" value="吃太油" class="sr-only"><span class="border-2 border-stone-100 bg-white">吃太油</span></label>
+                                <label class="relative cursor-pointer"><input type="checkbox" name="dietPrecautions" value="忘記喝水" class="sr-only"><span class="border-2 border-stone-100 bg-white">忘記喝水</span></label>
+                                <label class="relative cursor-pointer"><input type="checkbox" name="dietPrecautions" value="其他" class="sr-only" onchange="toggleOtherInput('dietOtherContainer', this)"><span class="border-2 border-stone-100 bg-white">其他</span></label>
+                            </div>
+                            <div id="dietOtherContainer" class="mt-4 hidden">
+                                <textarea id="dietOtherText" placeholder="填寫其他生活注意點..." class="w-full p-6 text-xl border-2 border-emerald-100 rounded-3xl bg-emerald-50/50 outline-none h-24"></textarea>
+                            </div>
+                        </div>
+
+                        <!-- 8. 正常餐食 -->
+                        <div>
+                            <label class="block text-2xl font-bold text-emerald-800 mb-5">8. 用餐情形 (可多選)</label>
+                            <div class="grid grid-cols-2 gap-4 checkbox-group">
+                                <label class="relative cursor-pointer"><input type="checkbox" name="normalMeals" value="早餐" class="sr-only"><span class="border-2 border-stone-100 bg-white">早餐</span></label>
+                                <label class="relative cursor-pointer"><input type="checkbox" name="normalMeals" value="午餐" class="sr-only"><span class="border-2 border-stone-100 bg-white">午餐</span></label>
+                                <label class="relative cursor-pointer"><input type="checkbox" name="normalMeals" value="晚餐" class="sr-only"><span class="border-2 border-stone-100 bg-white">晚餐</span></label>
+                                <label class="relative cursor-pointer"><input type="checkbox" name="normalMeals" value="點心" class="sr-only"><span class="border-2 border-stone-100 bg-white">點心</span></label>
+                            </div>
+                        </div>
+
+                        <button type="button" onclick="saveRecord()" class="btn-green w-full text-white font-black text-3xl py-8 rounded-[2.5rem] hover:opacity-90 transition active:scale-95 shadow-2xl">
+                            儲存今日紀錄
+                        </button>
+                    </form>
+                </div>
+            </div>
+
+            <!-- Right: Chart & Table -->
+            <div class="lg:col-span-7 space-y-10">
+                <div class="earth-card p-10 rounded-[3rem]">
+                    <h2 class="text-3xl font-black mb-8 text-emerald-900 italic text-center md:text-left">📈 身體狀況走勢圖</h2>
+                    <div class="h-[450px]">
+                        <canvas id="healthChart"></canvas>
+                    </div>
+                </div>
+
+                <div class="earth-card rounded-[3rem] overflow-hidden shadow-2xl">
+                    <div class="p-8 border-b border-stone-50 bg-stone-50/50">
+                        <h2 class="text-3xl font-black text-emerald-900">🗂 歷史健康清單</h2>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left border-collapse">
+                            <thead>
+                                <tr class="bg-emerald-800 text-white text-xl font-bold">
+                                    <th class="p-6">日期</th>
+                                    <th class="p-6 text-center text-nowrap">暈眩級別</th>
+                                    <th class="p-6 text-nowrap">睡眠狀況</th>
+                                    <th class="p-6">生活細節</th>
+                                    <th class="p-6">操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="recordList" class="divide-y divide-stone-100">
+                                <!-- Data injects here -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
